@@ -78,28 +78,25 @@ async def wait_for_otp(email: str, token: str, timeout: int = 180) -> Optional[s
     return None
 
 async def fill_otp(page, otp: str):
-    # Try single field first
     try:
         await page.fill("input[name='otp'], input[name='code'], input[placeholder*='code'], input[placeholder*='OTP']", otp, timeout=3000)
         return
     except:
         pass
-    # Multi-box OTP (common pattern: several single-digit inputs)
     try:
         boxes = await page.query_selector_all("input[maxlength='1'], input[inputmode='numeric']")
         if len(boxes) >= len(otp):
             for i, digit in enumerate(otp):
                 await boxes[i].fill(digit)
-                await page.wait_for_timeout(100)
+                await page.wait_for_timeout(150)
             return
     except:
         pass
-    # Fallback: type into first visible input
     try:
         first = await page.query_selector("input")
         if first:
             await first.focus()
-            await page.keyboard.type(otp, delay=50)
+            await page.keyboard.type(otp, delay=80)
     except:
         pass
 
@@ -163,11 +160,6 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         print(f"[{index}] Submitted form", flush=True)
         await page.wait_for_timeout(5000)
 
-        content = await page.content()
-        if "error" in content.lower() or "invalid" in content.lower() or "already" in content.lower():
-            jobs[job_id]["log"].append(f"[{index}] Possible form error on page")
-            print(f"[{index}] Possible form error on page", flush=True)
-
         otp = await wait_for_otp(email, token, timeout=180)
         if not otp:
             result["status"] = "no_otp"
@@ -180,16 +172,37 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         await fill_otp(page, otp)
         jobs[job_id]["log"].append(f"[{index}] Filled OTP boxes")
         print(f"[{index}] Filled OTP boxes", flush=True)
+        await page.wait_for_timeout(1000)
 
-        # Try to submit OTP (may auto-submit on last digit)
-        try:
-            await page.click("button[type='submit'], button:has-text('Verify'), button:has-text('Continue'), button:has-text('Conferma')", timeout=5000)
-        except:
-            pass
-        jobs[job_id]["log"].append(f"[{index}] OTP submitted or auto-submitted")
-        await page.wait_for_timeout(3000)
+        # Strong OTP submit
+        submitted = False
+        for sel in ["button[type='submit']", "button:has-text('Verify')", "button:has-text('Continue')", "button:has-text('Conferma')", "button:has-text('Confirm')"]:
+            try:
+                await page.click(sel, timeout=3000)
+                submitted = True
+                break
+            except:
+                pass
+        if not submitted:
+            try:
+                await page.keyboard.press("Enter")
+            except:
+                pass
+        jobs[job_id]["log"].append(f"[{index}] OTP submitted")
+        print(f"[{index}] OTP submitted", flush=True)
+        await page.wait_for_timeout(5000)
 
-        result["status"] = "success"
+        # Check if we landed on a success / dashboard page
+        final_url = page.url
+        final_content = (await page.content()).lower()
+        if "dashboard" in final_url or "home" in final_url or "account" in final_content or "welcome" in final_content or "success" in final_content:
+            jobs[job_id]["log"].append(f"[{index}] Registration appears successful")
+            print(f"[{index}] Registration appears successful", flush=True)
+            result["status"] = "success"
+        else:
+            result["status"] = "otp_submitted"
+            result["error"] = "OTP sent but no clear success page"
+
         return result
     except Exception as e:
         result["status"] = "error"
@@ -279,4 +292,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using mail.tm temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="2"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using mail.tm temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""

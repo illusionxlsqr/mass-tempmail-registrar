@@ -64,11 +64,20 @@ async def wait_for_otp(login: str, domain: str, timeout: int = 120) -> Optional[
     return None
 
 async def register_one(browser: Browser, req: RegisterRequest, job_id: str, index: int, proxy: Optional[str] = None) -> dict:
-    email, login, domain = await get_temp_email()
-    password = random_password()
-    result = {"index": index, "email": email, "password": password, "status": "started", "otp": None, "error": None}
-    jobs[job_id]["results"].append(result)
-    jobs[job_id]["log"].append(f"[{index}] Generated {email}")
+    print(f"[{index}] Entering register_one", flush=True)
+    jobs[job_id]["log"].append(f"[{index}] Entering register_one")
+    try:
+        email, login, domain = await get_temp_email()
+        password = random_password()
+        result = {"index": index, "email": email, "password": password, "status": "started", "otp": None, "error": None}
+        jobs[job_id]["results"].append(result)
+        jobs[job_id]["log"].append(f"[{index}] Generated {email}")
+        print(f"[{index}] Generated {email}", flush=True)
+    except Exception as e:
+        msg = f"[{index}] Failed to generate email: {e}"
+        jobs[job_id]["log"].append(msg)
+        print(msg, flush=True)
+        return {"index": index, "status": "error", "error": str(e)}
 
     context = None
     try:
@@ -79,6 +88,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         page = await context.new_page()
         await page.goto(req.url, wait_until="networkidle", timeout=60000)
         jobs[job_id]["log"].append(f"[{index}] Loaded page")
+        print(f"[{index}] Loaded page", flush=True)
 
         await page.fill(req.email_selector, email, timeout=10000)
         try:
@@ -104,6 +114,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
 
         await page.click(req.submit_selector, timeout=10000)
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
+        print(f"[{index}] Submitted form", flush=True)
         await page.wait_for_timeout(3000)
 
         otp = await wait_for_otp(login, domain)
@@ -126,6 +137,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         result["status"] = "error"
         result["error"] = str(e)
         jobs[job_id]["log"].append(f"[{index}] Error: {e}")
+        print(f"[{index}] Error: {e}", flush=True)
         return result
     finally:
         if context:
@@ -134,17 +146,21 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
 async def run_batch(job_id: str, req: RegisterRequest):
     jobs[job_id]["status"] = "running"
     jobs[job_id]["log"].append("Entering run_batch")
+    print("Entering run_batch", flush=True)
     try:
         async with async_playwright() as p:
             jobs[job_id]["log"].append("Playwright context entered, launching chromium...")
+            print("Launching chromium...", flush=True)
             browser = await p.chromium.launch(headless=True)
             jobs[job_id]["log"].append("Chromium launched successfully")
+            print("Chromium launched", flush=True)
             sem = asyncio.Semaphore(req.concurrency)
             tasks = []
 
             async def wrapped(i):
                 async with sem:
                     jobs[job_id]["log"].append(f"Starting account {i}")
+                    print(f"Starting account {i}", flush=True)
                     return await register_one(browser, req, job_id, i, req.proxy)
 
             for i in range(req.count):
@@ -153,12 +169,16 @@ async def run_batch(job_id: str, req: RegisterRequest):
             await asyncio.gather(*tasks, return_exceptions=True)
             await browser.close()
             jobs[job_id]["log"].append("Browser closed")
+            print("Browser closed", flush=True)
     except Exception as e:
-        jobs[job_id]["log"].append(f"run_batch exception: {type(e).__name__}: {e}")
+        msg = f"run_batch exception: {type(e).__name__}: {e}"
+        jobs[job_id]["log"].append(msg)
+        print(msg, flush=True)
         jobs[job_id]["status"] = "error"
         return
     jobs[job_id]["status"] = "done"
     jobs[job_id]["log"].append("Batch finished")
+    print("Batch finished", flush=True)
 
 @app.post("/start")
 async def start_registration(

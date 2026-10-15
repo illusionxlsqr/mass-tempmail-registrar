@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import random
 import re
@@ -37,19 +36,13 @@ def random_password(length: int = 16) -> str:
 
 async def get_temp_email() -> tuple[str, str, str]:
     await asyncio.sleep(random.uniform(0.5, 1.5))
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get("https://api.temp-mail.org/request/domains/format/json")
-        r.raise_for_status()
-        domains = r.json()
-        if not domains:
-            raise Exception("No domains from temp-mail")
-        domain = random.choice(domains)
-        login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        email = f"{login}@{domain}"
-        email_hash = hashlib.md5(email.encode()).hexdigest()
-        return email, login, email_hash
+    domains = ["grabmail.io", "mixozia.com", "linqmail.com"]
+    domain = random.choice(domains)
+    login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    email = f"{login}@{domain}"
+    return email, login, email
 
-async def wait_for_otp(email: str, email_hash: str, job_id: str, index: int, timeout: int = 90) -> Optional[str]:
+async def wait_for_otp(email: str, _, job_id: str, index: int, timeout: int = 90) -> Optional[str]:
     jobs[job_id]["log"].append(f"[{index}] OTP wait started for {email}")
     print(f"Starting OTP wait for {email}", flush=True)
     async with httpx.AsyncClient(timeout=15) as client:
@@ -58,14 +51,15 @@ async def wait_for_otp(email: str, email_hash: str, job_id: str, index: int, tim
         while time.time() - start < timeout:
             poll_count += 1
             try:
-                r = await client.get(f"https://api.temp-mail.org/request/mail/id/{email_hash}/format/json")
+                r = await client.get(f"https://grabmail.io/api/v1/mailbox?address={email}")
                 jobs[job_id]["log"].append(f"[{index}] OTP poll {poll_count}: status {r.status_code}")
                 if r.status_code == 200:
-                    msgs = r.json()
+                    data = r.json()
+                    msgs = data.get("messages", [])
                     if isinstance(msgs, list) and msgs:
                         text = ""
                         for m in msgs:
-                            text += str(m.get("mail_text", "")) + str(m.get("mail_subject", "")) + str(m.get("mail_html", ""))
+                            text += str(m.get("text", "")) + str(m.get("preview", "")) + str(m.get("subject", ""))
                         jobs[job_id]["log"].append(f"[{index}] Found {len(msgs)} msgs, text len {len(text)}")
                         codes = re.findall(r"\b(\d{4,8})\b", text)
                         if codes:
@@ -112,7 +106,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
     print(f"[{index}] Entering register_one", flush=True)
     jobs[job_id]["log"].append(f"[{index}] Entering register_one")
     try:
-        email, login, email_hash = await get_temp_email()
+        email, login, _ = await get_temp_email()
         password = random_password()
         result = {"index": index, "email": email, "password": password, "status": "started", "otp": None, "error": None}
         jobs[job_id]["results"].append(result)
@@ -169,7 +163,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         jobs[job_id]["log"].append(f"[{index}] Starting OTP poll")
         print(f"[{index}] Starting OTP poll immediately", flush=True)
 
-        otp = await wait_for_otp(email, email_hash, job_id, index, timeout=90)
+        otp = await wait_for_otp(email, email, job_id, index, timeout=90)
         if not otp:
             result["status"] = "no_otp"
             result["error"] = "OTP not received in time"
@@ -284,4 +278,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using temp-mail.org temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using GrabMail temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""

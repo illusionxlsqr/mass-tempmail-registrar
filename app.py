@@ -1,0 +1,293 @@
+import asyncio
+import json
+import random
+import re
+import string
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional
+
+import httpx
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from playwright.async_api import async_playwright, Browser, Page
+from pydantic import BaseModel
+
+app = FastAPI(title="Mass Registrar")
+
+# In-memory store for jobs
+jobs: Dict[str, dict] = {}
+
+class RegisterRequest(BaseModel):
+    url: str
+    email_selector: str = "input[type='email'], input[name='email'], input[name='username']"
+    password_selector: str = "input[type='password'], input[name='password']"
+    submit_selector: str = "button[type='submit'], input[type='submit'], button:has-text('Sign up'), button:has-text('Register')"
+    otp_selector: str = "input[name='otp'], input[name='code'], input[placeholder*='code'], input[placeholder*='OTP']"
+    otp_submit_selector: str = "button[type='submit'], button:has-text('Verify'), button:has-text('Continue')"
+    count: int = 50
+    concurrency: int = 5
+    proxy: Optional[str] = None
+    captcha_key: Optional[str] = None
+
+def random_password(length: int = 16) -> str:
+    chars = string.ascii_letters + string.digits + "!@#$%^&*"
+    return ''.join(random.choice(chars) for _ in range(length))
+
+async def get_temp_email() -> tuple[str, str, str]:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get("https://www.1secmail.com/api/v1/?action=getDomainList")
+        domains = r.json()
+        domain = random.choice(domains)
+        login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        email = f"{login}@{domain}"
+        return email, login, domain
+
+async def wait_for_otp(login: str, domain: str, timeout: int = 120) -> Optional[str]:
+    async with httpx.AsyncClient(timeout=20) as client:
+        start = time.time()
+        while time.time() - start < timeout:
+            r = await client.get(
+                f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}"
+            )
+            msgs = r.json()
+            if msgs:
+                mid = msgs[0]["id"]
+                mr = await client.get(
+                    f"https://www.1secmail.com/api/v1/?action=readMessage&login={login}&domain={domain}&id={mid}"
+                )
+                body = mr.json()
+                text = body.get("textBody", "") + body.get("htmlBody", "") + body.get("body", "")
+                codes = re.findall(r"\b(\d{4,8})\b", text)
+                if codes:
+                    return codes[0]
+                m = re.search(r"(?:code|otp|verification|pin)[:\s]*(\d{4,8})", text, re.I)
+                if m:
+                    return m.group(1)
+            await asyncio.sleep(3)
+    return None
+
+async def register_one(
+    browser: Browser,
+    req: RegisterRequest,
+    job_id: str,
+    index: int,
+    proxy: Optional[str] = None
+) -> dict:
+    email, login, domain = await get_temp_email()
+    password = random_password()
+    result = {
+        "index": index,
+        "email": email,
+        "password": password,
+        "status": "started",
+        "otp": None,
+        "error": None
+    }
+    jobs[job_id]["results"].append(result)
+    jobs[job_id]["log"].append(f"[{index}] Generated {email}")
+
+    context = None
+    try:
+        context_options = {}
+        if proxy:
+            context_options["proxy"] = {"server": proxy}
+        context = await browser.new_context(**context_options)
+        page = await context.new_page()
+        await page.goto(req.url, wait_until="networkidle", timeout=60000)
+        jobs[job_id]["log"].append(f"[{index}] Loaded page")
+
+        await page.fill(req.email_selector, email, timeout=10000)
+        try:
+            await page.fill(req.password_selector, password, timeout=5000)
+        except:
+            pass
+
+        try:
+            checkboxes = await page.query_selector_all("input[type='checkbox']")
+            for cb in checkboxes:
+                try:
+                    await cb.check(timeout=2000)
+                except:
+                    pass
+            jobs[job_id]["log"].append(f"[{index}] Checked available boxes")
+        except Exception as e:
+            jobs[job_id]["log"].append(f"[{index}] Checkbox scan: {e}")
+
+        try:
+            await page.click("button:has-text('Accept'), button:has-text('Agree'), button:has-text('I accept'), button:has-text('Continue'), [role='button']:has-text('Accept')", timeout=3000)
+        except:
+            pass
+
+        await page.click(req.submit_selector, timeout=10000)
+        jobs[job_id]["log"].append(f"[{index}] Submitted form")
+        await page.wait_for_timeout(3000)
+
+        otp = await wait_for_otp(login, domain)
+        if not otp:
+            result["status"] = "no_otp"
+            result["error"] = "OTP not received in time"
+            return result
+        result["otp"] = otp
+        jobs[job_id]["log"].append(f"[{index}] Got OTP: {otp}")
+
+        await page.fill(req.otp_selector, otp, timeout=10000)
+        if req.otp_submit_selector:
+            await page.click(req.otp_submit_selector, timeout=10000)
+        jobs[job_id]["log"].append(f"[{index}] Submitted OTP")
+        await page.wait_for_timeout(3000)
+
+        result["status"] = "success"
+        return result
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        jobs[job_id]["log"].append(f"[{index}] Error: {e}")
+        return result
+    finally:
+        if context:
+            await context.close()
+
+async def run_batch(job_id: str, req: RegisterRequest):
+    jobs[job_id]["status"] = "running"
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        sem = asyncio.Semaphore(req.concurrency)
+        tasks = []
+
+        async def wrapped(i):
+            async with sem:
+                return await register_one(browser, req, job_id, i, req.proxy)
+
+        for i in range(req.count):
+            tasks.append(asyncio.create_task(wrapped(i)))
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await browser.close()
+    jobs[job_id]["status"] = "done"
+
+@app.post("/start")
+async def start_registration(
+    url: str = Form(...),
+    email_selector: str = Form("input[type='email'], input[name='email']"),
+    password_selector: str = Form("input[type='password']"),
+    submit_selector: str = Form("button[type='submit']"),
+    otp_selector: str = Form("input[name='otp'], input[placeholder*='code']"),
+    otp_submit_selector: str = Form("button[type='submit']"),
+    count: int = Form(50),
+    concurrency: int = Form(5),
+    proxy: str = Form(None),
+):
+    job_id = f"job_{int(time.time())}"
+    req = RegisterRequest(
+        url=url,
+        email_selector=email_selector,
+        password_selector=password_selector,
+        submit_selector=submit_selector,
+        otp_selector=otp_selector,
+        otp_submit_selector=otp_submit_selector,
+        count=min(count, 100),
+        concurrency=min(concurrency, 10),
+        proxy=proxy if proxy else None,
+    )
+    jobs[job_id] = {
+        "status": "queued",
+        "results": [],
+        "log": [f"Started batch of {req.count}"],
+        "req": req.dict(),
+    }
+    asyncio.create_task(run_batch(job_id, req))
+    return {"job_id": job_id}
+
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    if job_id not in jobs:
+        return JSONResponse({"error": "not found"}, 404)
+    return jobs[job_id]
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Mass Account Registrar</title>
+<style>
+body { font-family: monospace; background: #111; color: #0f0; padding: 20px; }
+input, button, textarea { background: #222; color: #0f0; border: 1px solid #0f0; padding: 8px; margin: 4px; width: 100%; max-width: 600px; }
+button { width: auto; cursor: pointer; }
+#log { height: 300px; overflow: auto; border: 1px solid #0f0; padding: 10px; background: #000; }
+.success { color: #0f0; }
+.error { color: #f00; }
+</style>
+</head>
+<body>
+<h1>Mass TempMail Registrar</h1>
+<p>Registers accounts on target site using 1secmail temporary emails. Pulls OTP automatically. Handles up to 50+ in batch.</p>
+<form id="form">
+<label>Target Registration URL</label><br>
+<input name="url" placeholder="https://example.com/register" required><br>
+<label>Email field selector</label><br>
+<input name="email_selector" value="input[type='email'], input[name='email']"><br>
+<label>Password field selector</label><br>
+<input name="password_selector" value="input[type='password']"><br>
+<label>Submit button selector</label><br>
+<input name="submit_selector" value="button[type='submit']"><br>
+<label>OTP field selector</label><br>
+<input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br>
+<label>OTP submit selector</label><br>
+<input name="otp_submit_selector" value="button[type='submit']"><br>
+<label>Count (default 50)</label><br>
+<input name="count" type="number" value="50"><br>
+<label>Concurrency (1-10)</label><br>
+<input name="concurrency" type="number" value="5"><br>
+<label>Proxy (optional, e.g. http://user:pass@host:port)</label><br>
+<input name="proxy" placeholder=""><br>
+<button type="submit">Start Batch</button>
+</form>
+<div id="status"></div>
+<div id="log"></div>
+<script>
+const form = document.getElementById('form');
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+let currentJob = null;
+
+form.onsubmit = async (e) => {
+  e.preventDefault();
+  const fd = new FormData(form);
+  const res = await fetch('/start', { method: 'POST', body: fd });
+  const data = await res.json();
+  currentJob = data.job_id;
+  statusEl.textContent = 'Job started: ' + currentJob;
+  poll();
+};
+
+async function poll() {
+  if (!currentJob) return;
+  const res = await fetch('/status/' + currentJob);
+  const data = await res.json();
+  logEl.innerHTML = data.log.slice(-50).join('<br>') + '<br>';
+  const results = data.results || [];
+  let summary = results.map(r => 
+    `<div class="${r.status === 'success' ? 'success' : 'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp || ''} ${r.error || ''}</div>`
+  ).join('');
+  logEl.innerHTML += summary;
+  logEl.scrollTop = logEl.scrollHeight;
+  if (data.status !== 'done') {
+    setTimeout(poll, 2000);
+  } else {
+    statusEl.textContent = 'Done. Download results below.';
+    const blob = new Blob([JSON.stringify(data.results, null, 2)], {type: 'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'accounts.json';
+    a.textContent = 'Download accounts.json';
+    statusEl.appendChild(a);
+  }
+}
+</script>
+</body>
+</html>
+"""

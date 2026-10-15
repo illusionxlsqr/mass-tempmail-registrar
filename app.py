@@ -34,6 +34,7 @@ class RegisterRequest(BaseModel):
     captcha_key: Optional[str] = None
     base_email: Optional[str] = None
     imap_password: Optional[str] = None
+    manual_otp: Optional[str] = None
 
 def random_password(length: int = 16) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
@@ -107,19 +108,20 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
                 status, data = mail.search(None, "ALL")
             if status == "OK" and data[0]:
                 msg_ids = data[0].split()
-                for mid in msg_ids[-5:]:
+                for mid in msg_ids[-8:]:
                     status, msg_data = mail.fetch(mid, "(RFC822)")
                     if status == "OK":
                         raw = msg_data[0][1]
                         msg = email.message_from_bytes(raw)
-                        to_header = msg.get("To", "") or ""
-                        delivered = msg.get("Delivered-To", "") or ""
+                        to_header = str(msg.get("To", "") or "")
+                        delivered = str(msg.get("Delivered-To", "") or "")
                         if target_email.lower() not in (to_header + delivered).lower():
                             continue
                         body = ""
                         if msg.is_multipart():
                             for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
+                                ctype = part.get_content_type()
+                                if ctype in ("text/plain", "text/html"):
                                     body += safe_decode_payload(part)
                         else:
                             body = safe_decode_payload(msg)
@@ -127,7 +129,7 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
                         subj_header = msg.get("Subject", "")
                         if subj_header:
                             decoded = decode_header(subj_header)
-                            subject = "".join([str(t[0], t[1] or "utf-8") if isinstance(t[0], bytes) else t[0] for t in decoded])
+                            subject = "".join([str(t[0], t[1] or "utf-8") if isinstance(t[0], bytes) else str(t[0]) for t in decoded])
                         full_text = subject + " " + body
                         otp = extract_otp_from_text(full_text)
                         if otp:
@@ -139,11 +141,14 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
         except Exception as e:
             jobs[job_id]["log"].append(f"[{index}] IMAP poll error: {e}")
             print(f"IMAP error: {e}", flush=True)
-        await asyncio.sleep(5)
+        await asyncio.sleep(4)
     jobs[job_id]["log"].append(f"[{index}] IMAP OTP wait timed out")
     return None
 
-async def wait_for_otp(email: str, _, job_id: str, index: int, timeout: int = 90, base_email: Optional[str] = None, imap_password: Optional[str] = None) -> Optional[str]:
+async def wait_for_otp(email: str, _, job_id: str, index: int, timeout: int = 90, base_email: Optional[str] = None, imap_password: Optional[str] = None, manual_otp: Optional[str] = None) -> Optional[str]:
+    if manual_otp and manual_otp.strip():
+        jobs[job_id]["log"].append(f"[{index}] Using manual OTP: {manual_otp}")
+        return manual_otp.strip()
     if base_email and imap_password:
         return await wait_for_otp_imap(base_email, imap_password, email, job_id, index, timeout)
     jobs[job_id]["log"].append(f"[{index}] OTP wait started for {email}")
@@ -257,7 +262,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         jobs[job_id]["log"].append(f"[{index}] Starting OTP poll")
         print(f"[{index}] Starting OTP poll immediately", flush=True)
 
-        otp = await wait_for_otp(email_addr, email_addr, job_id, index, timeout=90, base_email=req.base_email, imap_password=req.imap_password)
+        otp = await wait_for_otp(email_addr, email_addr, job_id, index, timeout=90, base_email=req.base_email, imap_password=req.imap_password, manual_otp=req.manual_otp)
         if not otp:
             result["status"] = "no_otp"
             result["error"] = "OTP not received in time"
@@ -344,6 +349,7 @@ async def start_registration(
     proxy: str = Form(None),
     base_email: str = Form(None),
     imap_password: str = Form(None),
+    manual_otp: str = Form(None),
 ):
     job_id = f"job_{int(time.time())}"
     req = RegisterRequest(
@@ -358,6 +364,7 @@ async def start_registration(
         proxy=proxy if proxy else None,
         base_email=base_email if base_email else None,
         imap_password=imap_password if imap_password else None,
+        manual_otp=manual_otp if manual_otp else None,
     )
     jobs[job_id] = {
         "status": "queued",
@@ -376,4 +383,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass Registrar (IMAP + Plus Addressing)</h1><p>Uses your real email with plus addressing. Supports Gmail and iCloud. Credentials pre-filled.</p><form id="form"><label>Target Registration URL</label><br><input name="url" value="https://www.bbdbuyeu.com/m/register?inviteCode=oTitSv" required><br><label>Base Email (Gmail or iCloud)</label><br><input name="base_email" value="jacopobalbi1@icloud.com" required><br><label>App Password (not regular password)</label><br><input name="imap_password" type="password" value="ibkt-uxvn-xgae-kasn" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass Registrar</h1><p>Gmail plus addressing + IMAP. Put your Gmail and App Password. Optional: paste OTP manually if auto fails.</p><form id="form"><label>Target Registration URL</label><br><input name="url" value="https://www.bbdbuyeu.com/m/register?inviteCode=oTitSv" required><br><label>Base Gmail</label><br><input name="base_email" placeholder="yourname@gmail.com" required><br><label>Gmail App Password</label><br><input name="imap_password" type="password" placeholder="16-char app password" required><br><label>Manual OTP (optional, if auto fails)</label><br><input name="manual_otp" placeholder="paste code here if needed"><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""

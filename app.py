@@ -35,7 +35,7 @@ def random_password(length: int = 16) -> str:
     return ''.join(random.choice(chars) for _ in range(length))
 
 async def get_temp_email() -> tuple[str, str, str]:
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, verify=False) as client:
         r = await client.get("https://www.1secmail.com/api/v1/?action=getDomainList")
         domains = r.json()
         domain = random.choice(domains)
@@ -44,7 +44,7 @@ async def get_temp_email() -> tuple[str, str, str]:
         return email, login, domain
 
 async def wait_for_otp(login: str, domain: str, timeout: int = 120) -> Optional[str]:
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=20, verify=False) as client:
         start = time.time()
         while time.time() - start < timeout:
             r = await client.get(f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}")

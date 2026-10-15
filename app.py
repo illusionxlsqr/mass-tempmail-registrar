@@ -54,6 +54,7 @@ async def get_temp_email() -> tuple[str, str, str]:
         return email, login, token
 
 async def wait_for_otp(email: str, token: str, timeout: int = 180) -> Optional[str]:
+    print(f"Starting OTP wait for {email}", flush=True)
     async with httpx.AsyncClient(timeout=20) as client:
         headers = {"Authorization": f"Bearer {token}"}
         start = time.time()
@@ -61,6 +62,7 @@ async def wait_for_otp(email: str, token: str, timeout: int = 180) -> Optional[s
             r = await client.get("https://api.mail.tm/messages", headers=headers)
             r.raise_for_status()
             msgs = r.json().get("hydra:member", [])
+            print(f"OTP poll: {len(msgs)} messages", flush=True)
             if msgs:
                 mid = msgs[0]["id"]
                 mr = await client.get(f"https://api.mail.tm/messages/{mid}", headers=headers)
@@ -75,6 +77,7 @@ async def wait_for_otp(email: str, token: str, timeout: int = 180) -> Optional[s
                 if m:
                     return m.group(1)
             await asyncio.sleep(5)
+    print("OTP wait timed out", flush=True)
     return None
 
 async def fill_otp(page, otp: str):
@@ -159,11 +162,13 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
         print(f"[{index}] Submitted form", flush=True)
         await page.wait_for_timeout(5000)
+        print(f"[{index}] After submit wait, starting OTP poll", flush=True)
 
         otp = await wait_for_otp(email, token, timeout=180)
         if not otp:
             result["status"] = "no_otp"
             result["error"] = "OTP not received in time"
+            print(f"[{index}] No OTP", flush=True)
             return result
         result["otp"] = otp
         jobs[job_id]["log"].append(f"[{index}] Got OTP: {otp}")
@@ -174,7 +179,6 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         print(f"[{index}] Filled OTP boxes", flush=True)
         await page.wait_for_timeout(1000)
 
-        # Strong OTP submit
         submitted = False
         for sel in ["button[type='submit']", "button:has-text('Verify')", "button:has-text('Continue')", "button:has-text('Conferma')", "button:has-text('Confirm')"]:
             try:
@@ -192,7 +196,6 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         print(f"[{index}] OTP submitted", flush=True)
         await page.wait_for_timeout(5000)
 
-        # Check if we landed on a success / dashboard page
         final_url = page.url
         final_content = (await page.content()).lower()
         if "dashboard" in final_url or "home" in final_url or "account" in final_content or "welcome" in final_content or "success" in final_content:
@@ -259,7 +262,7 @@ async def start_registration(
     submit_selector: str = Form("button[type='submit']"),
     otp_selector: str = Form("input[name='otp'], input[placeholder*='code']"),
     otp_submit_selector: str = Form("button[type='submit']"),
-    count: int = Form(2),
+    count: int = Form(1),
     concurrency: int = Form(1),
     proxy: str = Form(None),
 ):
@@ -271,7 +274,7 @@ async def start_registration(
         submit_selector=submit_selector,
         otp_selector=otp_selector,
         otp_submit_selector=otp_submit_selector,
-        count=min(count, 5),
+        count=1,
         concurrency=1,
         proxy=proxy if proxy else None,
     )

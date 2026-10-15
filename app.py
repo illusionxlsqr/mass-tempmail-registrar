@@ -90,6 +90,21 @@ def safe_decode_payload(part) -> str:
     except Exception:
         return ""
 
+def safe_decode_header(header_value) -> str:
+    try:
+        if not header_value:
+            return ""
+        decoded = decode_header(header_value)
+        parts = []
+        for t, enc in decoded:
+            if isinstance(t, bytes):
+                parts.append(t.decode(enc or "utf-8", errors="ignore"))
+            else:
+                parts.append(str(t))
+        return "".join(parts)
+    except Exception:
+        return str(header_value)
+
 async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: str, job_id: str, index: int, timeout: int = 90) -> Optional[str]:
     jobs[job_id]["log"].append(f"[{index}] OTP wait IMAP started for {target_email}")
     print(f"Starting OTP IMAP wait for {target_email}", flush=True)
@@ -109,12 +124,14 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
             if status == "OK" and data[0]:
                 msg_ids = data[0].split()
                 for mid in msg_ids[-8:]:
-                    status, msg_data = mail.fetch(mid, "(RFC822)")
-                    if status == "OK":
+                    try:
+                        status, msg_data = mail.fetch(mid, "(RFC822)")
+                        if status != "OK":
+                            continue
                         raw = msg_data[0][1]
                         msg = email.message_from_bytes(raw)
-                        to_header = str(msg.get("To", "") or "")
-                        delivered = str(msg.get("Delivered-To", "") or "")
+                        to_header = safe_decode_header(msg.get("To", ""))
+                        delivered = safe_decode_header(msg.get("Delivered-To", ""))
                         if target_email.lower() not in (to_header + delivered).lower():
                             continue
                         body = ""
@@ -125,17 +142,16 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
                                     body += safe_decode_payload(part)
                         else:
                             body = safe_decode_payload(msg)
-                        subject = ""
-                        subj_header = msg.get("Subject", "")
-                        if subj_header:
-                            decoded = decode_header(subj_header)
-                            subject = "".join([str(t[0], t[1] or "utf-8") if isinstance(t[0], bytes) else str(t[0]) for t in decoded])
+                        subject = safe_decode_header(msg.get("Subject", ""))
                         full_text = subject + " " + body
                         otp = extract_otp_from_text(full_text)
                         if otp:
                             mail.logout()
                             jobs[job_id]["log"].append(f"[{index}] Found OTP via IMAP: {otp}")
                             return otp
+                    except Exception as inner:
+                        jobs[job_id]["log"].append(f"[{index}] Message parse error: {inner}")
+                        continue
             mail.logout()
             jobs[job_id]["log"].append(f"[{index}] IMAP poll {poll_count}: no matching message yet")
         except Exception as e:

@@ -25,8 +25,8 @@ class RegisterRequest(BaseModel):
     submit_selector: str = "button[type='submit'], input[type='submit'], button:has-text('Sign up'), button:has-text('Register')"
     otp_selector: str = "input[name='otp'], input[name='code'], input[placeholder*='code'], input[placeholder*='OTP']"
     otp_submit_selector: str = "button[type='submit'], button:has-text('Verify'), button:has-text('Continue')"
-    count: int = 50
-    concurrency: int = 2
+    count: int = 5
+    concurrency: int = 1
     proxy: Optional[str] = None
     captcha_key: Optional[str] = None
 
@@ -35,7 +35,7 @@ def random_password(length: int = 16) -> str:
     return ''.join(random.choice(chars) for _ in range(length))
 
 async def get_temp_email() -> tuple[str, str, str]:
-    await asyncio.sleep(random.uniform(1.5, 3.0))  # stronger delay against 429
+    await asyncio.sleep(random.uniform(2.0, 4.0))
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get("https://api.mail.tm/domains")
         r.raise_for_status()
@@ -53,7 +53,7 @@ async def get_temp_email() -> tuple[str, str, str]:
         token = token_r.json()["token"]
         return email, login, token
 
-async def wait_for_otp(email: str, token: str, timeout: int = 120) -> Optional[str]:
+async def wait_for_otp(email: str, token: str, timeout: int = 180) -> Optional[str]:
     async with httpx.AsyncClient(timeout=20) as client:
         headers = {"Authorization": f"Bearer {token}"}
         start = time.time()
@@ -66,14 +66,15 @@ async def wait_for_otp(email: str, token: str, timeout: int = 120) -> Optional[s
                 mr = await client.get(f"https://api.mail.tm/messages/{mid}", headers=headers)
                 mr.raise_for_status()
                 body = mr.json()
-                text = body.get("text", "") + body.get("intro", "")
+                text = body.get("text", "") + body.get("intro", "") + body.get("subject", "")
+                print(f"OTP search text preview: {text[:200]}", flush=True)
                 codes = re.findall(r"\b(\d{4,8})\b", text)
                 if codes:
                     return codes[0]
-                m = re.search(r"(?:code|otp|verification|pin)[:\s]*(\d{4,8})", text, re.I)
+                m = re.search(r"(?:code|otp|verification|pin|codice)[:\s]*(\d{4,8})", text, re.I)
                 if m:
                     return m.group(1)
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
     return None
 
 async def register_one(browser: Browser, req: RegisterRequest, job_id: str, index: int, proxy: Optional[str] = None) -> dict:
@@ -109,9 +110,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         except:
             pass
 
-        # Robust terms acceptance: click label + force JS check
         try:
-            # Click the label that contains the checkbox text
             await page.click("label:has-text('terms'), label:has-text('termini'), label:has-text('agree'), label:has-text('accetto')", timeout=3000)
         except:
             pass
@@ -130,22 +129,28 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         except Exception as e:
             jobs[job_id]["log"].append(f"[{index}] Checkbox JS: {e}")
 
-        # Click submit, force if needed
         try:
             await page.click(req.submit_selector, timeout=8000)
         except:
             await page.click(req.submit_selector, force=True, timeout=5000)
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
         print(f"[{index}] Submitted form", flush=True)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(5000)
 
-        otp = await wait_for_otp(email, token)
+        # Check page content after submit for errors or success
+        content = await page.content()
+        if "error" in content.lower() or "invalid" in content.lower() or "already" in content.lower():
+            jobs[job_id]["log"].append(f"[{index}] Possible form error on page")
+            print(f"[{index}] Possible form error on page", flush=True)
+
+        otp = await wait_for_otp(email, token, timeout=180)
         if not otp:
             result["status"] = "no_otp"
             result["error"] = "OTP not received in time"
             return result
         result["otp"] = otp
         jobs[job_id]["log"].append(f"[{index}] Got OTP: {otp}")
+        print(f"[{index}] Got OTP: {otp}", flush=True)
 
         await page.fill(req.otp_selector, otp, timeout=10000)
         if req.otp_submit_selector:
@@ -176,7 +181,7 @@ async def run_batch(job_id: str, req: RegisterRequest):
             browser = await p.chromium.launch(headless=True)
             jobs[job_id]["log"].append("Chromium launched successfully")
             print("Chromium launched", flush=True)
-            sem = asyncio.Semaphore(2)
+            sem = asyncio.Semaphore(1)
             tasks = []
 
             async def wrapped(i):
@@ -210,8 +215,8 @@ async def start_registration(
     submit_selector: str = Form("button[type='submit']"),
     otp_selector: str = Form("input[name='otp'], input[placeholder*='code']"),
     otp_submit_selector: str = Form("button[type='submit']"),
-    count: int = Form(10),
-    concurrency: int = Form(2),
+    count: int = Form(3),
+    concurrency: int = Form(1),
     proxy: str = Form(None),
 ):
     job_id = f"job_{int(time.time())}"
@@ -222,8 +227,8 @@ async def start_registration(
         submit_selector=submit_selector,
         otp_selector=otp_selector,
         otp_submit_selector=otp_submit_selector,
-        count=min(count, 20),
-        concurrency=min(concurrency, 2),
+        count=min(count, 5),
+        concurrency=1,
         proxy=proxy if proxy else None,
     )
     jobs[job_id] = {
@@ -243,4 +248,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using mail.tm temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="5"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using mail.tm temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="2"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""

@@ -77,6 +77,32 @@ async def wait_for_otp(email: str, token: str, timeout: int = 180) -> Optional[s
             await asyncio.sleep(5)
     return None
 
+async def fill_otp(page, otp: str):
+    # Try single field first
+    try:
+        await page.fill("input[name='otp'], input[name='code'], input[placeholder*='code'], input[placeholder*='OTP']", otp, timeout=3000)
+        return
+    except:
+        pass
+    # Multi-box OTP (common pattern: several single-digit inputs)
+    try:
+        boxes = await page.query_selector_all("input[maxlength='1'], input[inputmode='numeric']")
+        if len(boxes) >= len(otp):
+            for i, digit in enumerate(otp):
+                await boxes[i].fill(digit)
+                await page.wait_for_timeout(100)
+            return
+    except:
+        pass
+    # Fallback: type into first visible input
+    try:
+        first = await page.query_selector("input")
+        if first:
+            await first.focus()
+            await page.keyboard.type(otp, delay=50)
+    except:
+        pass
+
 async def register_one(browser: Browser, req: RegisterRequest, job_id: str, index: int, proxy: Optional[str] = None) -> dict:
     print(f"[{index}] Entering register_one", flush=True)
     jobs[job_id]["log"].append(f"[{index}] Entering register_one")
@@ -137,7 +163,6 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         print(f"[{index}] Submitted form", flush=True)
         await page.wait_for_timeout(5000)
 
-        # Check page content after submit for errors or success
         content = await page.content()
         if "error" in content.lower() or "invalid" in content.lower() or "already" in content.lower():
             jobs[job_id]["log"].append(f"[{index}] Possible form error on page")
@@ -152,10 +177,16 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         jobs[job_id]["log"].append(f"[{index}] Got OTP: {otp}")
         print(f"[{index}] Got OTP: {otp}", flush=True)
 
-        await page.fill(req.otp_selector, otp, timeout=10000)
-        if req.otp_submit_selector:
-            await page.click(req.otp_submit_selector, timeout=10000)
-        jobs[job_id]["log"].append(f"[{index}] Submitted OTP")
+        await fill_otp(page, otp)
+        jobs[job_id]["log"].append(f"[{index}] Filled OTP boxes")
+        print(f"[{index}] Filled OTP boxes", flush=True)
+
+        # Try to submit OTP (may auto-submit on last digit)
+        try:
+            await page.click("button[type='submit'], button:has-text('Verify'), button:has-text('Continue'), button:has-text('Conferma')", timeout=5000)
+        except:
+            pass
+        jobs[job_id]["log"].append(f"[{index}] OTP submitted or auto-submitted")
         await page.wait_for_timeout(3000)
 
         result["status"] = "success"
@@ -215,7 +246,7 @@ async def start_registration(
     submit_selector: str = Form("button[type='submit']"),
     otp_selector: str = Form("input[name='otp'], input[placeholder*='code']"),
     otp_submit_selector: str = Form("button[type='submit']"),
-    count: int = Form(3),
+    count: int = Form(2),
     concurrency: int = Form(1),
     proxy: str = Form(None),
 ):

@@ -45,31 +45,40 @@ async def get_temp_email() -> tuple[str, str, str]:
         email = data["email"]
         return email, email.split("@")[0], email
 
-async def wait_for_otp(email: str, _, timeout: int = 120) -> Optional[str]:
+async def wait_for_otp(email: str, job_id: str, index: int, timeout: int = 90) -> Optional[str]:
+    jobs[job_id]["log"].append(f"[{index}] OTP wait started for {email}")
     print(f"Starting OTP wait for {email}", flush=True)
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         start = time.time()
+        poll_count = 0
         while time.time() - start < timeout:
+            poll_count += 1
             try:
                 r = await client.get(f"https://tempmailc.com/api/v1/inbox?email={email}")
+                jobs[job_id]["log"].append(f"[{index}] OTP poll {poll_count}: status {r.status_code}")
                 if r.status_code == 200:
                     data = r.json()
                     msgs = data.get("messages", data.get("inbox", []))
                     if isinstance(msgs, list) and msgs:
                         text = ""
                         for m in msgs:
-                            text += m.get("text", "") + m.get("body", "") + m.get("subject", "") + m.get("intro", "")
-                        print(f"OTP search text preview: {text[:200]}", flush=True)
+                            text += str(m.get("text", "")) + str(m.get("body", "")) + str(m.get("subject", "")) + str(m.get("intro", ""))
+                        jobs[job_id]["log"].append(f"[{index}] Found {len(msgs)} msgs, text len {len(text)}")
                         codes = re.findall(r"\b(\d{4,8})\b", text)
                         if codes:
                             return codes[0]
                         m = re.search(r"(?:code|otp|verification|pin|codice)[:\s]*(\d{4,8})", text, re.I)
                         if m:
                             return m.group(1)
-                print(f"OTP poll: no messages yet", flush=True)
+                    else:
+                        jobs[job_id]["log"].append(f"[{index}] No messages yet")
+                else:
+                    jobs[job_id]["log"].append(f"[{index}] Inbox status {r.status_code}")
             except Exception as e:
+                jobs[job_id]["log"].append(f"[{index}] OTP poll error: {e}")
                 print(f"OTP poll error: {e}", flush=True)
             await asyncio.sleep(5)
+    jobs[job_id]["log"].append(f"[{index}] OTP wait timed out")
     print("OTP wait timed out", flush=True)
     return None
 
@@ -154,13 +163,14 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
         print(f"[{index}] Submitted form", flush=True)
 
-        print(f"[{index}] Starting OTP poll immediately", flush=True)
         jobs[job_id]["log"].append(f"[{index}] Starting OTP poll")
+        print(f"[{index}] Starting OTP poll immediately", flush=True)
 
-        otp = await wait_for_otp(email, email, timeout=120)
+        otp = await wait_for_otp(email, job_id, index, timeout=90)
         if not otp:
             result["status"] = "no_otp"
             result["error"] = "OTP not received in time"
+            jobs[job_id]["log"].append(f"[{index}] No OTP")
             print(f"[{index}] No OTP", flush=True)
             return result
         result["otp"] = otp

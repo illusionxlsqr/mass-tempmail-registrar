@@ -76,6 +76,19 @@ def extract_otp_from_text(text: str) -> Optional[str]:
         return m.group(1)
     return None
 
+def safe_decode_payload(part) -> str:
+    try:
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return ""
+        if isinstance(payload, bytes):
+            return payload.decode(errors="ignore")
+        if isinstance(payload, str):
+            return payload
+        return str(payload)
+    except Exception:
+        return ""
+
 async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: str, job_id: str, index: int, timeout: int = 90) -> Optional[str]:
     jobs[job_id]["log"].append(f"[{index}] OTP wait IMAP started for {target_email}")
     print(f"Starting OTP IMAP wait for {target_email}", flush=True)
@@ -107,9 +120,9 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
                         if msg.is_multipart():
                             for part in msg.walk():
                                 if part.get_content_type() == "text/plain":
-                                    body += part.get_payload(decode=True).decode(errors="ignore")
+                                    body += safe_decode_payload(part)
                         else:
-                            body = msg.get_payload(decode=True).decode(errors="ignore")
+                            body = safe_decode_payload(msg)
                         subject = ""
                         subj_header = msg.get("Subject", "")
                         if subj_header:

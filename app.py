@@ -144,7 +144,6 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
             }""")
             jobs[job_id]["log"].append(f"[{index}] Forced checkbox checked")
             print(f"[{index}] Forced checkbox checked", flush=True)
-            await page.wait_for_timeout(1000)
         except Exception as e:
             jobs[job_id]["log"].append(f"[{index}] Checkbox JS: {e}")
 
@@ -155,11 +154,8 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
         print(f"[{index}] Submitted form", flush=True)
 
-        try:
-            await page.wait_for_timeout(3000)
-        except:
-            pass
-        print(f"[{index}] Starting OTP poll now", flush=True)
+        print(f"[{index}] Starting OTP poll immediately", flush=True)
+        jobs[job_id]["log"].append(f"[{index}] Starting OTP poll")
 
         otp = await wait_for_otp(email, email, timeout=120)
         if not otp:

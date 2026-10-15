@@ -26,7 +26,7 @@ class RegisterRequest(BaseModel):
     otp_selector: str = "input[name='otp'], input[name='code'], input[placeholder*='code'], input[placeholder*='OTP']"
     otp_submit_selector: str = "button[type='submit'], button:has-text('Verify'), button:has-text('Continue')"
     count: int = 50
-    concurrency: int = 5
+    concurrency: int = 2
     proxy: Optional[str] = None
     captcha_key: Optional[str] = None
 
@@ -35,8 +35,8 @@ def random_password(length: int = 16) -> str:
     return ''.join(random.choice(chars) for _ in range(length))
 
 async def get_temp_email() -> tuple[str, str, str]:
-    await asyncio.sleep(random.uniform(0.5, 1.5))  # rate limit delay
-    async with httpx.AsyncClient(timeout=20) as client:
+    await asyncio.sleep(random.uniform(1.5, 3.0))  # stronger delay against 429
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get("https://api.mail.tm/domains")
         r.raise_for_status()
         domains = r.json().get("hydra:member", [])
@@ -109,25 +109,35 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         except:
             pass
 
-        # Force click the terms checkbox (name=agreeToTerms or any checkbox)
+        # Robust terms acceptance: click label + force JS check
         try:
-            await page.click("input[name='agreeToTerms'], input[type='checkbox']", timeout=5000)
-            jobs[job_id]["log"].append(f"[{index}] Clicked terms checkbox")
-            print(f"[{index}] Clicked terms checkbox", flush=True)
-            await page.wait_for_timeout(1000)
-        except Exception as e:
-            jobs[job_id]["log"].append(f"[{index}] Checkbox click: {e}")
-
-        # Wait for submit button to become enabled, then click
-        try:
-            await page.wait_for_selector(req.submit_selector + ":not([disabled])", timeout=5000)
-            await page.click(req.submit_selector, timeout=10000)
+            # Click the label that contains the checkbox text
+            await page.click("label:has-text('terms'), label:has-text('termini'), label:has-text('agree'), label:has-text('accetto')", timeout=3000)
         except:
-            # Force click if still disabled
-            await page.click(req.submit_selector, force=True, timeout=10000)
+            pass
+        try:
+            await page.evaluate("""() => {
+                const cb = document.querySelector('input[name="agreeToTerms"], input[type="checkbox"]');
+                if (cb) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', { bubbles: true }));
+                    cb.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }""")
+            jobs[job_id]["log"].append(f"[{index}] Forced checkbox checked")
+            print(f"[{index}] Forced checkbox checked", flush=True)
+            await page.wait_for_timeout(1500)
+        except Exception as e:
+            jobs[job_id]["log"].append(f"[{index}] Checkbox JS: {e}")
+
+        # Click submit, force if needed
+        try:
+            await page.click(req.submit_selector, timeout=8000)
+        except:
+            await page.click(req.submit_selector, force=True, timeout=5000)
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
         print(f"[{index}] Submitted form", flush=True)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(4000)
 
         otp = await wait_for_otp(email, token)
         if not otp:
@@ -166,7 +176,7 @@ async def run_batch(job_id: str, req: RegisterRequest):
             browser = await p.chromium.launch(headless=True)
             jobs[job_id]["log"].append("Chromium launched successfully")
             print("Chromium launched", flush=True)
-            sem = asyncio.Semaphore(min(req.concurrency, 2))  # lower concurrency to avoid 429
+            sem = asyncio.Semaphore(2)
             tasks = []
 
             async def wrapped(i):
@@ -200,8 +210,8 @@ async def start_registration(
     submit_selector: str = Form("button[type='submit']"),
     otp_selector: str = Form("input[name='otp'], input[placeholder*='code']"),
     otp_submit_selector: str = Form("button[type='submit']"),
-    count: int = Form(50),
-    concurrency: int = Form(5),
+    count: int = Form(10),
+    concurrency: int = Form(2),
     proxy: str = Form(None),
 ):
     job_id = f"job_{int(time.time())}"
@@ -212,8 +222,8 @@ async def start_registration(
         submit_selector=submit_selector,
         otp_selector=otp_selector,
         otp_submit_selector=otp_submit_selector,
-        count=min(count, 100),
-        concurrency=min(concurrency, 10),
+        count=min(count, 20),
+        concurrency=min(concurrency, 2),
         proxy=proxy if proxy else None,
     )
     jobs[job_id] = {
@@ -233,4 +243,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using mail.tm temporary emails. Pulls OTP automatically. Handles up to 50+ in batch.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count (default 50)</label><br><input name="count" type="number" value="50"><br><label>Concurrency (1-10)</label><br><input name="concurrency" type="number" value="2"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using mail.tm temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="5"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""

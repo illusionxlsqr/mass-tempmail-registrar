@@ -89,15 +89,23 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
             mail = imaplib.IMAP4_SSL(imap_server)
             mail.login(base_email, imap_password)
             mail.select("inbox")
-            status, data = mail.search(None, f'(TO "{target_email}")')
+            # search UNSEEN first, then recent
+            status, data = mail.search(None, "UNSEEN")
+            if status != "OK" or not data[0]:
+                status, data = mail.search(None, "ALL")
             if status == "OK" and data[0]:
                 msg_ids = data[0].split()
-                if msg_ids:
-                    latest = msg_ids[-1]
-                    status, msg_data = mail.fetch(latest, "(RFC822)")
+                # check last 5 messages
+                for mid in msg_ids[-5:]:
+                    status, msg_data = mail.fetch(mid, "(RFC822)")
                     if status == "OK":
                         raw = msg_data[0][1]
                         msg = email.message_from_bytes(raw)
+                        # check if this message is related to our target
+                        to_header = msg.get("To", "") or ""
+                        delivered = msg.get("Delivered-To", "") or ""
+                        if target_email.lower() not in (to_header + delivered).lower():
+                            continue
                         body = ""
                         if msg.is_multipart():
                             for part in msg.walk():
@@ -112,8 +120,8 @@ async def wait_for_otp_imap(base_email: str, imap_password: str, target_email: s
                             subject = "".join([str(t[0], t[1] or "utf-8") if isinstance(t[0], bytes) else t[0] for t in decoded])
                         full_text = subject + " " + body
                         otp = extract_otp_from_text(full_text)
-                        mail.logout()
                         if otp:
+                            mail.logout()
                             jobs[job_id]["log"].append(f"[{index}] Found OTP via IMAP: {otp}")
                             return otp
             mail.logout()

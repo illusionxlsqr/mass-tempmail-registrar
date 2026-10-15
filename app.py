@@ -35,41 +35,41 @@ def random_password(length: int = 16) -> str:
     return ''.join(random.choice(chars) for _ in range(length))
 
 async def get_temp_email() -> tuple[str, str, str]:
-    await asyncio.sleep(random.uniform(1.0, 2.0))
+    await asyncio.sleep(random.uniform(0.5, 1.5))
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get("https://api.guerrillamail.com/ajax.php?f=get_email_address")
+        # temp-mail.org style API (public endpoints)
+        r = await client.get("https://api.temp-mail.org/request/domains/format/json")
         r.raise_for_status()
-        data = r.json()
-        email = data.get("email_addr")
-        sid = data.get("sid_token")
-        if not email or not sid:
-            raise Exception("Guerrilla Mail failed")
-        return email, email.split("@")[0], sid
+        domains = r.json()
+        if not domains:
+            raise Exception("No domains from temp-mail")
+        domain = random.choice(domains)
+        login = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        email = f"{login}@{domain}"
+        # MD5 of email is used as key in their API
+        import hashlib
+        email_hash = hashlib.md5(email.encode()).hexdigest()
+        return email, login, email_hash
 
-async def wait_for_otp(email: str, sid: str, timeout: int = 120) -> Optional[str]:
+async def wait_for_otp(email: str, email_hash: str, timeout: int = 120) -> Optional[str]:
     print(f"Starting OTP wait for {email}", flush=True)
     async with httpx.AsyncClient(timeout=20) as client:
         start = time.time()
         while time.time() - start < timeout:
             try:
-                r = await client.get(f"https://api.guerrillamail.com/ajax.php?f=check_email&sid_token={sid}&seq=0")
-                r.raise_for_status()
-                data = r.json()
-                msgs = data.get("list", [])
-                print(f"OTP poll: {len(msgs)} messages", flush=True)
-                if msgs:
-                    mid = msgs[0].get("mail_id")
-                    mr = await client.get(f"https://api.guerrillamail.com/ajax.php?f=fetch_email&sid_token={sid}&email_id={mid}")
-                    mr.raise_for_status()
-                    body = mr.json()
-                    text = body.get("mail_body", "") + body.get("mail_excerpt", "")
-                    print(f"OTP search text preview: {text[:200]}", flush=True)
-                    codes = re.findall(r"\b(\d{4,8})\b", text)
-                    if codes:
-                        return codes[0]
-                    m = re.search(r"(?:code|otp|verification|pin|codice)[:\s]*(\d{4,8})", text, re.I)
-                    if m:
-                        return m.group(1)
+                r = await client.get(f"https://api.temp-mail.org/request/mail/id/{email_hash}/format/json")
+                if r.status_code == 200:
+                    msgs = r.json()
+                    if isinstance(msgs, list) and msgs:
+                        text = msgs[0].get("mail_text", "") + msgs[0].get("mail_subject", "")
+                        print(f"OTP search text preview: {text[:200]}", flush=True)
+                        codes = re.findall(r"\b(\d{4,8})\b", text)
+                        if codes:
+                            return codes[0]
+                        m = re.search(r"(?:code|otp|verification|pin|codice)[:\s]*(\d{4,8})", text, re.I)
+                        if m:
+                            return m.group(1)
+                print(f"OTP poll: no messages yet", flush=True)
             except Exception as e:
                 print(f"OTP poll error: {e}", flush=True)
             await asyncio.sleep(5)
@@ -103,7 +103,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
     print(f"[{index}] Entering register_one", flush=True)
     jobs[job_id]["log"].append(f"[{index}] Entering register_one")
     try:
-        email, login, sid = await get_temp_email()
+        email, login, email_hash = await get_temp_email()
         password = random_password()
         result = {"index": index, "email": email, "password": password, "status": "started", "otp": None, "error": None}
         jobs[job_id]["results"].append(result)
@@ -158,14 +158,13 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
         print(f"[{index}] Submitted form", flush=True)
 
-        # Short wait then force OTP poll
         try:
             await page.wait_for_timeout(3000)
         except:
             pass
         print(f"[{index}] Starting OTP poll now", flush=True)
 
-        otp = await wait_for_otp(email, sid, timeout=120)
+        otp = await wait_for_otp(email, email_hash, timeout=120)
         if not otp:
             result["status"] = "no_otp"
             result["error"] = "OTP not received in time"
@@ -279,4 +278,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using Guerrilla Mail temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Account Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:300px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass TempMail Registrar</h1><p>Registers accounts on target site using temp-mail.org temporary emails. Pulls OTP automatically.</p><form id="form"><label>Target Registration URL</label><br><input name="url" placeholder="https://example.com/register" required><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><label>Proxy (optional)</label><br><input name="proxy" placeholder=""><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-50).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='success'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""

@@ -37,7 +37,6 @@ def random_password(length: int = 16) -> str:
 async def get_temp_email() -> tuple[str, str, str]:
     await asyncio.sleep(random.uniform(1.0, 2.0))
     async with httpx.AsyncClient(timeout=30) as client:
-        # Guerrilla Mail
         r = await client.get("https://api.guerrillamail.com/ajax.php?f=get_email_address")
         r.raise_for_status()
         data = r.json()
@@ -47,29 +46,32 @@ async def get_temp_email() -> tuple[str, str, str]:
             raise Exception("Guerrilla Mail failed")
         return email, email.split("@")[0], sid
 
-async def wait_for_otp(email: str, sid: str, timeout: int = 180) -> Optional[str]:
+async def wait_for_otp(email: str, sid: str, timeout: int = 120) -> Optional[str]:
     print(f"Starting OTP wait for {email}", flush=True)
     async with httpx.AsyncClient(timeout=20) as client:
         start = time.time()
         while time.time() - start < timeout:
-            r = await client.get(f"https://api.guerrillamail.com/ajax.php?f=check_email&sid_token={sid}&seq=0")
-            r.raise_for_status()
-            data = r.json()
-            msgs = data.get("list", [])
-            print(f"OTP poll: {len(msgs)} messages", flush=True)
-            if msgs:
-                mid = msgs[0].get("mail_id")
-                mr = await client.get(f"https://api.guerrillamail.com/ajax.php?f=fetch_email&sid_token={sid}&email_id={mid}")
-                mr.raise_for_status()
-                body = mr.json()
-                text = body.get("mail_body", "") + body.get("mail_excerpt", "")
-                print(f"OTP search text preview: {text[:200]}", flush=True)
-                codes = re.findall(r"\b(\d{4,8})\b", text)
-                if codes:
-                    return codes[0]
-                m = re.search(r"(?:code|otp|verification|pin|codice)[:\s]*(\d{4,8})", text, re.I)
-                if m:
-                    return m.group(1)
+            try:
+                r = await client.get(f"https://api.guerrillamail.com/ajax.php?f=check_email&sid_token={sid}&seq=0")
+                r.raise_for_status()
+                data = r.json()
+                msgs = data.get("list", [])
+                print(f"OTP poll: {len(msgs)} messages", flush=True)
+                if msgs:
+                    mid = msgs[0].get("mail_id")
+                    mr = await client.get(f"https://api.guerrillamail.com/ajax.php?f=fetch_email&sid_token={sid}&email_id={mid}")
+                    mr.raise_for_status()
+                    body = mr.json()
+                    text = body.get("mail_body", "") + body.get("mail_excerpt", "")
+                    print(f"OTP search text preview: {text[:200]}", flush=True)
+                    codes = re.findall(r"\b(\d{4,8})\b", text)
+                    if codes:
+                        return codes[0]
+                    m = re.search(r"(?:code|otp|verification|pin|codice)[:\s]*(\d{4,8})", text, re.I)
+                    if m:
+                        return m.group(1)
+            except Exception as e:
+                print(f"OTP poll error: {e}", flush=True)
             await asyncio.sleep(5)
     print("OTP wait timed out", flush=True)
     return None
@@ -145,7 +147,7 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
             }""")
             jobs[job_id]["log"].append(f"[{index}] Forced checkbox checked")
             print(f"[{index}] Forced checkbox checked", flush=True)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1000)
         except Exception as e:
             jobs[job_id]["log"].append(f"[{index}] Checkbox JS: {e}")
 
@@ -155,10 +157,15 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
             await page.click(req.submit_selector, force=True, timeout=5000)
         jobs[job_id]["log"].append(f"[{index}] Submitted form")
         print(f"[{index}] Submitted form", flush=True)
-        await page.wait_for_timeout(5000)
-        print(f"[{index}] After submit wait, starting OTP poll", flush=True)
 
-        otp = await wait_for_otp(email, sid, timeout=180)
+        # Short wait then force OTP poll
+        try:
+            await page.wait_for_timeout(3000)
+        except:
+            pass
+        print(f"[{index}] Starting OTP poll now", flush=True)
+
+        otp = await wait_for_otp(email, sid, timeout=120)
         if not otp:
             result["status"] = "no_otp"
             result["error"] = "OTP not received in time"
@@ -171,35 +178,18 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
         await fill_otp(page, otp)
         jobs[job_id]["log"].append(f"[{index}] Filled OTP boxes")
         print(f"[{index}] Filled OTP boxes", flush=True)
-        await page.wait_for_timeout(1000)
 
-        submitted = False
-        for sel in ["button[type='submit']", "button:has-text('Verify')", "button:has-text('Continue')", "button:has-text('Conferma')", "button:has-text('Confirm')"]:
-            try:
-                await page.click(sel, timeout=3000)
-                submitted = True
-                break
-            except:
-                pass
-        if not submitted:
+        try:
+            await page.click("button[type='submit'], button:has-text('Verify'), button:has-text('Continue'), button:has-text('Conferma')", timeout=4000)
+        except:
             try:
                 await page.keyboard.press("Enter")
             except:
                 pass
         jobs[job_id]["log"].append(f"[{index}] OTP submitted")
         print(f"[{index}] OTP submitted", flush=True)
-        await page.wait_for_timeout(5000)
 
-        final_url = page.url
-        final_content = (await page.content()).lower()
-        if "dashboard" in final_url or "home" in final_url or "account" in final_content or "welcome" in final_content or "success" in final_content:
-            jobs[job_id]["log"].append(f"[{index}] Registration appears successful")
-            print(f"[{index}] Registration appears successful", flush=True)
-            result["status"] = "success"
-        else:
-            result["status"] = "otp_submitted"
-            result["error"] = "OTP sent but no clear success page"
-
+        result["status"] = "otp_submitted"
         return result
     except Exception as e:
         result["status"] = "error"

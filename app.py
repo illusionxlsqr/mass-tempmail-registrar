@@ -43,7 +43,64 @@ def extract_otp_from_text(text: str) -> Optional[str]:
         return m.group(1)
     return None
 
-# --- Provider implementations ---
+# --- Providers ---
+
+async def create_1secmail() -> Tuple[str, str, str]:
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get("https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1")
+        data = r.json()
+        if not data:
+            raise Exception("1secmail empty")
+        address = data[0]
+        login, domain = address.split("@")
+        return address, f"{login}|{domain}", "1secmail"
+
+async def poll_1secmail(token: str) -> Optional[str]:
+    login, domain = token.split("|")
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(f"https://www.1secmail.com/api/v1/?action=getMessages&login={login}&domain={domain}")
+        if r.status_code == 200:
+            msgs = r.json()
+            if msgs:
+                mid = msgs[0]["id"]
+                full = await client.get(f"https://www.1secmail.com/api/v1/?action=readMessage&login={login}&domain={domain}&id={mid}")
+                if full.status_code == 200:
+                    data = full.json()
+                    text = str(data.get("textBody", "")) + str(data.get("subject", "")) + str(data.get("body", ""))
+                    return extract_otp_from_text(text)
+    return None
+
+async def create_mail_gw() -> Tuple[str, str, str]:
+    async with httpx.AsyncClient(timeout=20, verify=False) as client:
+        domains_r = await client.get("https://api.mail.gw/domains")
+        domains = [d["domain"] for d in domains_r.json().get("hydra:member", []) if d.get("isActive")]
+        if not domains:
+            raise Exception("no mail.gw domains")
+        domain = random.choice(domains)
+        local = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        address = f"{local}@{domain}"
+        password = random_password(12)
+        acc = await client.post("https://api.mail.gw/accounts", json={"address": address, "password": password})
+        if acc.status_code not in (200, 201):
+            raise Exception(f"mail.gw account {acc.status_code}")
+        token_r = await client.post("https://api.mail.gw/token", json={"address": address, "password": password})
+        token = token_r.json().get("token")
+        if not token:
+            raise Exception("mail.gw no token")
+        return address, token, "mail.gw"
+
+async def poll_mail_gw(token: str) -> Optional[str]:
+    async with httpx.AsyncClient(timeout=15, verify=False) as client:
+        r = await client.get("https://api.mail.gw/messages", headers={"Authorization": f"Bearer {token}"})
+        if r.status_code == 200:
+            msgs = r.json().get("hydra:member", [])
+            if msgs:
+                full = await client.get(f"https://api.mail.gw/messages/{msgs[0]['id']}", headers={"Authorization": f"Bearer {token}"})
+                if full.status_code == 200:
+                    data = full.json()
+                    text = str(data.get("text", "")) + str(data.get("intro", "")) + str(data.get("subject", ""))
+                    return extract_otp_from_text(text)
+    return None
 
 async def create_mail_tm() -> Tuple[str, str, str]:
     async with httpx.AsyncClient(timeout=20, verify=False) as client:
@@ -116,12 +173,15 @@ async def poll_tempmail_lol(token: str) -> Optional[str]:
     return None
 
 PROVIDERS = [
+    ("1secmail", create_1secmail, poll_1secmail),
+    ("mail.gw", create_mail_gw, poll_mail_gw),
     ("mail.tm", create_mail_tm, poll_mail_tm),
     ("guerrilla", create_guerrilla, poll_guerrilla),
     ("tempmail.lol", create_tempmail_lol, poll_tempmail_lol),
 ]
 
 async def get_working_inbox(job_id: str, index: int) -> Tuple[str, str, str]:
+    random.shuffle(PROVIDERS)
     for name, create_fn, _ in PROVIDERS:
         try:
             address, token, provider = await create_fn()
@@ -328,4 +388,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:350px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass Registrar (multi-provider)</h1><p>Prova mail.tm → Guerrilla → tempmail.lol automaticamente. Random e AFK. Incolla OTP solo se necessario.</p><form id="form"><label>Target Registration URL</label><br><input name="url" value="https://www.bbdbuyeu.com/m/register?inviteCode=oTitSv" required><br><label>Manual OTP (optional)</label><br><input name="manual_otp" placeholder="incolla codice se non arriva auto"><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-60).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='otp_submitted'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:350px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass Registrar (multi-provider)</h1><p>Prova 1secmail, mail.gw, mail.tm, Guerrilla, tempmail.lol in ordine casuale. Random e AFK.</p><form id="form"><label>Target Registration URL</label><br><input name="url" value="https://www.bbdbuyeu.com/m/register?inviteCode=oTitSv" required><br><label>Manual OTP (optional)</label><br><input name="manual_otp" placeholder="incolla codice se non arriva auto"><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-60).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='otp_submitted'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""

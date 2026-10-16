@@ -4,7 +4,7 @@ import random
 import re
 import string
 import time
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Form
@@ -32,24 +32,17 @@ def random_password(length: int = 16) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
     return ''.join(random.choice(chars) for _ in range(length))
 
-async def create_mail_tm() -> tuple[str, str, str]:
-    async with httpx.AsyncClient(timeout=20, verify=False) as client:
-        domains_r = await client.get("https://api.mail.tm/domains")
-        domains = domains_r.json().get("hydra:member", [])
-        if not domains:
-            raise Exception("no domains")
-        domain = random.choice(domains)["domain"]
-        local = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        address = f"{local}@{domain}"
-        password = random_password(12)
-        acc = await client.post("https://api.mail.tm/accounts", json={"address": address, "password": password})
-        if acc.status_code not in (200, 201):
-            raise Exception(f"account create {acc.status_code}")
-        token_r = await client.post("https://api.mail.tm/token", json={"address": address, "password": password})
-        token = token_r.json().get("token")
-        if not token:
-            raise Exception("no token")
-        return address, password, token
+async def create_tempmail_lol() -> tuple[str, str]:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post("https://api.tempmail.lol/v2/inbox/create", json={})
+        if r.status_code not in (200, 201):
+            raise Exception(f"create failed {r.status_code}: {r.text}")
+        data = r.json()
+        address = data.get("address")
+        token = data.get("token")
+        if not address or not token:
+            raise Exception(f"bad response: {data}")
+        return address, token
 
 def extract_otp_from_text(text: str) -> Optional[str]:
     codes = re.findall(r"\b(\d{4,8})\b", text)
@@ -60,26 +53,25 @@ def extract_otp_from_text(text: str) -> Optional[str]:
         return m.group(1)
     return None
 
-async def wait_for_otp_mailtm(token: str, job_id: str, index: int, timeout: int = 90) -> Optional[str]:
-    jobs[job_id]["log"].append(f"[{index}] OTP wait mail.tm started")
-    headers = {"Authorization": f"Bearer {token}"}
+async def wait_for_otp_tempmail(token: str, job_id: str, index: int, timeout: int = 90) -> Optional[str]:
+    jobs[job_id]["log"].append(f"[{index}] OTP wait tempmail.lol started")
     start = time.time()
     poll_count = 0
-    async with httpx.AsyncClient(timeout=15, verify=False) as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         while time.time() - start < timeout:
             poll_count += 1
             try:
-                r = await client.get("https://api.mail.tm/messages", headers=headers)
-                jobs[job_id]["log"].append(f"[{index}] mail.tm poll {poll_count}: {r.status_code}")
+                r = await client.get(f"https://api.tempmail.lol/v2/inbox?token={token}")
+                jobs[job_id]["log"].append(f"[{index}] tempmail poll {poll_count}: {r.status_code}")
                 if r.status_code == 200:
-                    msgs = r.json().get("hydra:member", [])
-                    if msgs:
-                        latest = msgs[0]
-                        msg_id = latest["id"]
-                        full = await client.get(f"https://api.mail.tm/messages/{msg_id}", headers=headers)
-                        if full.status_code == 200:
-                            data = full.json()
-                            text = str(data.get("text", "")) + str(data.get("intro", "")) + str(data.get("subject", ""))
+                    data = r.json()
+                    if data.get("expired"):
+                        jobs[job_id]["log"].append(f"[{index}] Inbox expired")
+                        return None
+                    emails = data.get("emails", [])
+                    if emails:
+                        for em in emails:
+                            text = str(em.get("body", "")) + str(em.get("subject", "")) + str(em.get("html", "") or "")
                             otp = extract_otp_from_text(text)
                             if otp:
                                 jobs[job_id]["log"].append(f"[{index}] Found OTP: {otp}")
@@ -118,12 +110,12 @@ async def fill_otp(page, otp: str):
 async def register_one(browser: Browser, req: RegisterRequest, job_id: str, index: int) -> dict:
     jobs[job_id]["log"].append(f"[{index}] Entering register_one")
     try:
-        address, mail_pass, token = await create_mail_tm()
+        address, token = await create_tempmail_lol()
         password = random_password()
-        result = {"index": index, "email": address, "password": password, "status": "started", "otp": None, "error": None, "inbox": f"https://mail.tm (login {address})"}
+        result = {"index": index, "email": address, "password": password, "status": "started", "otp": None, "error": None}
         jobs[job_id]["results"].append(result)
         jobs[job_id]["log"].append(f"[{index}] Generated {address}")
-        jobs[job_id]["log"].append(f"[{index}] Inbox: https://mail.tm (user: {address} / pass: {mail_pass})")
+        jobs[job_id]["log"].append(f"[{index}] Check inbox at https://tempmail.lol/en/ (token in logs if needed)")
     except Exception as e:
         jobs[job_id]["log"].append(f"[{index}] Failed to generate email: {e}")
         return {"index": index, "status": "error", "error": str(e)}
@@ -165,12 +157,12 @@ async def register_one(browser: Browser, req: RegisterRequest, job_id: str, inde
             otp = req.manual_otp.strip()
             jobs[job_id]["log"].append(f"[{index}] Using manual OTP: {otp}")
         else:
-            otp = await wait_for_otp_mailtm(token, job_id, index)
+            otp = await wait_for_otp_tempmail(token, job_id, index)
 
         if not otp:
             result["status"] = "no_otp"
-            result["error"] = "OTP not received - check inbox and use Manual OTP"
-            jobs[job_id]["log"].append(f"[{index}] No OTP - check https://mail.tm with {address}")
+            result["error"] = "OTP not received - check https://tempmail.lol and use Manual OTP"
+            jobs[job_id]["log"].append(f"[{index}] No OTP")
             return result
 
         result["otp"] = otp
@@ -271,4 +263,4 @@ async def get_status(job_id: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """<!DOCTYPE html><html><head><title>Mass Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:350px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass Registrar (mail.tm)</h1><p>Genera email temporanea su mail.tm. Controlla inbox su https://mail.tm dal telefono se serve. Incolla OTP nel campo Manual se auto non lo prende.</p><form id="form"><label>Target Registration URL</label><br><input name="url" value="https://www.bbdbuyeu.com/m/register?inviteCode=oTitSv" required><br><label>Manual OTP (optional)</label><br><input name="manual_otp" placeholder="incolla codice se non arriva auto"><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-60).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='otp_submitted'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
+    return """<!DOCTYPE html><html><head><title>Mass Registrar</title><style>body{font-family:monospace;background:#111;color:#0f0;padding:20px;}input,button{background:#222;color:#0f0;border:1px solid #0f0;padding:8px;margin:4px;width:100%;max-width:600px;}button{width:auto;cursor:pointer;}#log{height:350px;overflow:auto;border:1px solid #0f0;padding:10px;background:#000;}.success{color:#0f0;}.error{color:#f00;}</style></head><body><h1>Mass Registrar (tempmail.lol)</h1><p>Usa tempmail.lol. Controlla inbox su https://tempmail.lol/en/ dal telefono se serve. Incolla OTP nel campo Manual se auto non lo prende.</p><form id="form"><label>Target Registration URL</label><br><input name="url" value="https://www.bbdbuyeu.com/m/register?inviteCode=oTitSv" required><br><label>Manual OTP (optional)</label><br><input name="manual_otp" placeholder="incolla codice se non arriva auto"><br><label>Email field selector</label><br><input name="email_selector" value="input[type='email'], input[name='email']"><br><label>Password field selector</label><br><input name="password_selector" value="input[type='password']"><br><label>Submit button selector</label><br><input name="submit_selector" value="button[type='submit']"><br><label>OTP field selector</label><br><input name="otp_selector" value="input[name='otp'], input[placeholder*='code'], input[placeholder*='OTP']"><br><label>OTP submit selector</label><br><input name="otp_submit_selector" value="button[type='submit']"><br><label>Count</label><br><input name="count" type="number" value="1"><br><label>Concurrency</label><br><input name="concurrency" type="number" value="1"><br><button type="submit">Start Batch</button></form><div id="status"></div><div id="log"></div><script>const form=document.getElementById('form');const logEl=document.getElementById('log');const statusEl=document.getElementById('status');let currentJob=null;form.onsubmit=async(e)=>{e.preventDefault();const fd=new FormData(form);const res=await fetch('/start',{method:'POST',body:fd});const data=await res.json();currentJob=data.job_id;statusEl.textContent='Job started: '+currentJob;poll();};async function poll(){if(!currentJob)return;const res=await fetch('/status/'+currentJob);const data=await res.json();logEl.innerHTML=data.log.slice(-60).join('<br>')+'<br>';const results=data.results||[];let summary=results.map(r=>`<div class="${r.status==='otp_submitted'?'success':'error'}">[${r.index}] ${r.email} : ${r.password} | ${r.status} ${r.otp||''} ${r.error||''}</div>`).join('');logEl.innerHTML+=summary;logEl.scrollTop=logEl.scrollHeight;if(data.status!=='done'){setTimeout(poll,2000);}else{statusEl.textContent='Done.';}}</script></body></html>"""
